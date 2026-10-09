@@ -2,7 +2,7 @@ name: Compilar APK Android
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, principal ]
   workflow_dispatch:
 
 jobs:
@@ -22,11 +22,17 @@ jobs:
       - name: Instalar Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.x'
           channel: 'stable'
 
-      - name: Instalar dependencias
-        run: flutter pub get
+      - name: Reconstruir estructura oficial de Flutter y Android
+        run: |
+          # Si la carpeta se creo como 'biblioteca', la renombramos a 'lib'
+          if [ -d "biblioteca" ] && [ ! -d "lib" ]; then
+            mv biblioteca lib
+          fi
+          # Generar el andamiaje nativo de Android
+          flutter create . --platforms=android --project-name=osciloscopio_app
+          flutter pub get
 
       - name: Compilar APK (Release)
         run: flutter build apk --split-per-abi
