@@ -7,82 +7,78 @@ import 'package:flutter/material.dart';
 void main() {
   runApp(const MaterialApp(
     debugShowCheckedModeBanner: false,
-    home: OsciloscopioCompletoScreen(),
+    home: OsciloscopioApp(),
   ));
 }
 
 class MarcadorPunto {
   final int id;
   final int canal;
-  final int indiceMuestra;
   final double tiempoSeg;
   final double voltaje;
 
   MarcadorPunto({
     required this.id,
     required this.canal,
-    required this.indiceMuestra,
     required this.tiempoSeg,
     required this.voltaje,
   });
 }
 
-class OsciloscopioCompletoScreen extends StatefulWidget {
-  const OsciloscopioCompletoScreen({Key? key}) : super(key: key);
+class OsciloscopioApp extends StatefulWidget {
+  const OsciloscopioApp({super.key});
 
   @override
-  State<OsciloscopioCompletoScreen> createState() => _OsciloscopioCompletoScreenState();
+  State<OsciloscopioApp> createState() => _OsciloscopioAppState();
 }
 
-class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen> {
+class _OsciloscopioAppState extends State<OsciloscopioApp> {
   RawDatagramSocket? _socket;
   Timer? _timerSimulacion;
-  bool _enEjecucion = false;
-  bool _modoSimulacion = false;
+  bool _conectado = false;
+  bool _simulando = false;
   bool _modoHold = false;
   bool _mostrarTabla = false;
   String _estadoTexto = "DESCONECTADO";
   Color _colorEstado = const Color(0xFF8A99AD);
 
-  // Búfer profundo de muestras (CH1, CH2, CH3)
-  static const int capacidadBuffer = 20000;
-  double _dtMuestra = 0.000000025; // 25 ns = 40 MSPS (Permite ver ondas de > 4 MHz)
-  double _tiempoAcumulado = 0.0;
+  // Búfer de datos
+  static const int capacidadMax = 2000;
   final List<List<double>> _canales = [[], [], []];
+  double _tiempoAcumulado = 0.0;
+  final double _dtSimulado = 0.000000025; // 25 ns = 40 MSPS para señales > 4 MHz
 
-  // Configuración individual por canal
+  // Parámetros por canal
   final List<double> _vDiv = [1.0, 1.0, 1.0];
   final List<double> _offsetY = [-2.0, 0.0, 2.0];
+  final List<bool> _visible = [true, true, true];
   final List<bool> _invertir = [false, false, false];
   final List<String> _acople = ["DC", "DC", "DC"];
-  final List<bool> _visibilidad = [true, true, true];
   int _canalActivo = 0;
 
-  // Base de tiempo (en microsegundos por división)
-  double _usPorDiv = 0.5; // 0.5 us/div * 10 div = 5 us (Permite ver 20 ciclos de 4 MHz)
-  double _desplazamientoUs = 0.0;
+  // Base de tiempo horizontal
+  double _usPorDiv = 0.5;
 
-  // Marcadores de inspección
-  final List<MarcadorPunto> _marcadores = [];
-  int _contadorMarcadores = 1;
-
+  // Colores idénticos a Visual C#
   final List<Color> _coloresCH = const [
     Color(0xFF00C8FF), // CH1 Cian
     Color(0xFFFFA000), // CH2 Ámbar
     Color(0xFFFF4141), // CH3 Rojo
   ];
 
-  String _telemetriaVoltaje = "CH1: -- | Vpp: -- | Vmax: -- | Vrms: --";
-  String _telemetriaTiempo = "T: -- | Frec: -- | Duty: --";
+  final List<MarcadorPunto> _marcadores = [];
+  int _contadorMarcadores = 1;
+
+  String _telemetriaV = "CH1: 0.00 V | Vpp: 0.00 V | Vrms: 0.00 V";
+  String _telemetriaT = "Base: 0.50 us/div | Muestras: 0";
   String _deltaMarcadores = "";
 
-  // --- MODO SIMULACIÓN INTERNA (4.5 MHz) ---
   void _toggleSimulacion() {
-    if (_modoSimulacion) {
+    if (_simulando) {
       _timerSimulacion?.cancel();
       setState(() {
-        _modoSimulacion = false;
-        _enEjecucion = false;
+        _simulando = false;
+        _conectado = false;
         _estadoTexto = "DESCONECTADO";
         _colorEstado = const Color(0xFF8A99AD);
       });
@@ -90,21 +86,17 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
     }
 
     _desconectarUDP();
-    _modoSimulacion = true;
-    _enEjecucion = true;
-    _dtMuestra = 0.000000025; // 40 MSPS
+    _simulando = true;
+    _conectado = true;
     _estadoTexto = "SIMULACIÓN 4.5 MHz";
     _colorEstado = const Color(0xFF00C8FF);
 
     _timerSimulacion = Timer.periodic(const Duration(milliseconds: 33), (t) {
       if (!_modoHold) {
-        for (int k = 0; k < 120; k++) {
-          _tiempoAcumulado += _dtMuestra;
-          // CH1: Seno 4.5 MHz
+        for (int k = 0; k < 60; k++) {
+          _tiempoAcumulado += _dtSimulado;
           double v1 = 1.65 + 1.35 * sin(2.0 * pi * 4500000.0 * _tiempoAcumulado);
-          // CH2: Rampa / Rizado 1.0 MHz
           double v2 = 1.65 + 1.10 * sin(2.0 * pi * 1000000.0 * _tiempoAcumulado);
-          // CH3: Pulso RF digital 2.25 MHz
           double v3 = (sin(2.0 * pi * 2250000.0 * _tiempoAcumulado) > 0) ? 3.3 : 0.0;
 
           _canales[0].add(v1);
@@ -113,29 +105,28 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
         }
 
         for (int c = 0; c < 3; c++) {
-          if (_canales[c].length > capacidadBuffer) {
-            _canales[c].removeRange(0, _canales[c].length - capacidadBuffer);
+          if (_canales[c].length > capacidadMax) {
+            _canales[c].removeRange(0, _canales[c].length - capacidadMax);
           }
         }
-        _actualizarCalculos();
+        _actualizarTelemetria();
         setState(() {});
       }
     });
     setState(() {});
   }
 
-  // --- RECEPTOR UDP ---
   Future<void> _toggleUDP() async {
-    if (_enEjecucion && !_modoSimulacion) {
+    if (_conectado && !_simulando) {
       _desconectarUDP();
       return;
     }
-    if (_modoSimulacion) _toggleSimulacion();
+    if (_simulando) _toggleSimulacion();
 
     try {
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 8888);
       setState(() {
-        _enEjecucion = true;
+        _conectado = true;
         _estadoTexto = "UDP :8888 ACTIVO";
         _colorEstado = const Color(0xFF2ECC71);
       });
@@ -144,14 +135,14 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
         if (event == RawSocketEvent.read) {
           final dg = _socket!.receive();
           if (dg != null && !_modoHold) {
-            _procesarPaqueteUDP(dg.data);
+            _procesarPaquete(dg.data);
           }
         }
       });
     } catch (e) {
       setState(() {
-        _enEjecucion = false;
-        _estadoTexto = "ERROR DE SOCKET";
+        _conectado = false;
+        _estadoTexto = "ERROR SOCKET";
         _colorEstado = const Color(0xFFDC3C3C);
       });
     }
@@ -161,18 +152,19 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
     _socket?.close();
     _socket = null;
     setState(() {
-      _enEjecucion = false;
+      _conectado = false;
       _estadoTexto = "DESCONECTADO";
       _colorEstado = const Color(0xFF8A99AD);
     });
   }
 
-  void _procesarPaqueteUDP(Uint8List data) {
-    int i = 0;
-    while (i <= data.length - 9) {
+  void _procesarPaquete(Uint8List data) {
+    for (int i = 0; i <= data.length - 9; i++) {
       if (data[i] == 0xAA && data[i + 8] == 0x55) {
         int chk = 0xAA;
-        for (int k = 1; k <= 6; k++) chk ^= data[i + k];
+        for (int k = 1; k <= 6; k++) {
+          chk ^= data[i + k];
+        }
 
         if ((chk & 0xFF) == data[i + 7]) {
           int adc1 = (data[i + 1] << 8) | data[i + 2];
@@ -184,19 +176,17 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
           _canales[2].add((adc3 * 3.3) / 4095.0);
 
           for (int c = 0; c < 3; c++) {
-            if (_canales[c].length > capacidadBuffer) _canales[c].removeAt(0);
+            if (_canales[c].length > capacidadMax) _canales[c].removeAt(0);
           }
-          i += 9;
-          continue;
+          i += 8;
         }
       }
-      i++;
     }
-    _actualizarCalculos();
+    _actualizarTelemetria();
     setState(() {});
   }
 
-  void _actualizarCalculos() {
+  void _actualizarTelemetria() {
     int ch = _canalActivo;
     if (_canales[ch].length < 10) return;
 
@@ -205,37 +195,14 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
     double vmin = m.reduce(min);
     double vpp = vmax - vmin;
 
-    double suma = 0, sq = 0;
+    double sumaCuad = 0;
     for (double v in m) {
-      suma += v;
-      sq += v * v;
+      sumaCuad += v * v;
     }
-    double vavg = suma / m.length;
-    double vrms = sqrt(sq / m.length);
+    double vrms = sqrt(sumaCuad / m.length);
 
-    _telemetriaVoltaje = "CH${ch + 1}: Vpp: ${vpp.toStringAsFixed(2)}V | Vmax: ${vmax.toStringAsFixed(2)}V | Vmin: ${vmin.toStringAsFixed(2)}V | Vrms: ${vrms.toStringAsFixed(2)}V";
-
-    double periodo = 0;
-    double mid = (vmax + vmin) / 2.0;
-    int idx1 = -1, idx2 = -1;
-    for (int k = m.length - 2; k > max(0, m.length - 800); k--) {
-      if (m[k] <= mid && m[k + 1] > mid) {
-        if (idx2 == -1) {
-          idx2 = k;
-        } else {
-          idx1 = k;
-          break;
-        }
-      }
-    }
-
-    if (idx1 != -1 && idx2 != -1) {
-      periodo = (idx2 - idx1) * _dtMuestra;
-      double frec = (periodo > 0) ? (1.0 / periodo) : 0;
-      _telemetriaTiempo = "T: ${(periodo * 1e6).toStringAsFixed(2)} us | F: ${(frec / 1e6).toStringAsFixed(2)} MHz";
-    } else {
-      _telemetriaTiempo = "Muestras: ${m.length} | Base: ${_usPorDiv.toStringAsFixed(2)} us/div";
-    }
+    _telemetriaV = "CH${ch + 1}: ${m.last.toStringAsFixed(2)} V | Vpp: ${vpp.toStringAsFixed(2)} V | Vrms: ${vrms.toStringAsFixed(2)} V";
+    _telemetriaT = "Base: ${_usPorDiv.toStringAsFixed(2)} us/div | Muestras: ${m.length}";
 
     if (_marcadores.length >= 2) {
       var m1 = _marcadores[_marcadores.length - 2];
@@ -249,24 +216,20 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
     }
   }
 
-  void _agregarMarcadorTáctil(Offset localPos, Size size) {
+  void _colocarMarcador(Offset localPos, Size size) {
     if (!_modoHold) return;
     int ch = _canalActivo;
-    int total = _canales[ch].length;
-    if (total < 2) return;
+    if (_canales[ch].length < 2) return;
 
-    double puntosPantalla = (_usPorDiv * 10.0 * 1e-6) / _dtMuestra;
-    int startIndex = max(0, total - puntosPantalla.toInt() - (_desplazamientoUs * 1e-6 / _dtMuestra).toInt());
-    int rel = ((localPos.dx / size.width) * puntosPantalla).toInt();
-    int absIdx = (startIndex + rel).clamp(0, total - 1);
+    int total = _canales[ch].length;
+    int rel = ((localPos.dx / size.width) * total).toInt().clamp(0, total - 1);
 
     setState(() {
       _marcadores.add(MarcadorPunto(
         id: _contadorMarcadores++,
         canal: ch,
-        indiceMuestra: absIdx,
-        tiempoSeg: absIdx * _dtMuestra,
-        voltaje: _canales[ch][absIdx],
+        tiempoSeg: rel * _dtSimulado,
+        voltaje: _canales[ch][rel],
       ));
     });
   }
@@ -285,9 +248,9 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
       body: SafeArea(
         child: Column(
           children: [
-            // ================= 1. BARRA SUPERIOR =================
+            // BARRA SUPERIOR
             Container(
-              height: 46,
+              height: 48,
               color: const Color(0xFF17202C),
               padding: const EdgeInsets.symmetric(horizontal: 6),
               child: Row(
@@ -296,22 +259,22 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
                   const SizedBox(width: 6),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _modoSimulacion ? Colors.purple : const Color(0xFF283648),
+                      backgroundColor: _simulando ? Colors.purple : const Color(0xFF283648),
                       padding: const EdgeInsets.symmetric(horizontal: 6),
-                      minimumSize: const Size(45, 28),
+                      minimumSize: const Size(44, 28),
                     ),
                     onPressed: _toggleSimulacion,
-                    child: Text(_modoSimulacion ? "SIM: ON" : "SIMULAR", style: const TextStyle(fontSize: 9)),
+                    child: Text(_simulando ? "PARAR" : "SIMULAR", style: const TextStyle(fontSize: 9)),
                   ),
                   const SizedBox(width: 4),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _enEjecucion && !_modoSimulacion ? Colors.redAccent : const Color(0xFF008CDC),
+                      backgroundColor: _conectado && !_simulando ? Colors.redAccent : const Color(0xFF008CDC),
                       padding: const EdgeInsets.symmetric(horizontal: 6),
-                      minimumSize: const Size(45, 28),
+                      minimumSize: const Size(44, 28),
                     ),
                     onPressed: _toggleUDP,
-                    child: Text(_enEjecucion && !_modoSimulacion ? "DESCONECTAR" : "UDP :8888", style: const TextStyle(fontSize: 9)),
+                    child: Text(_conectado && !_simulando ? "STOP" : "UDP", style: const TextStyle(fontSize: 9)),
                   ),
                   const SizedBox(width: 4),
                   ElevatedButton(
@@ -335,7 +298,9 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
                       minimumSize: const Size(38, 28),
                     ),
                     onPressed: () {
-                      for (var c in _canales) c.clear();
+                      for (var c in _canales) {
+                        c.clear();
+                      }
                       _marcadores.clear();
                       setState(() {});
                     },
@@ -347,33 +312,7 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
               ),
             ),
 
-            // ================= 2. MINIMAPA HISTÓRICO GLOBAL =================
-            GestureDetector(
-              onHorizontalDragUpdate: (details) {
-                if (_canales[_canalActivo].isEmpty) return;
-                setState(() {
-                  double factor = details.primaryDelta! / 300.0;
-                  _desplazamientoUs += factor * (_canales[_canalActivo].length * _dtMuestra * 1e6);
-                  _desplazamientoUs = _desplazamientoUs.clamp(0.0, 50000.0);
-                });
-              },
-              child: Container(
-                height: 24,
-                color: const Color(0xFF1C2533),
-                margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                child: CustomPaint(
-                  painter: MinimapaPainter(
-                    muestras: _canales[_canalActivo],
-                    color: _coloresCH[_canalActivo],
-                    usPorDiv: _usPorDiv,
-                    desplazamientoUs: _desplazamientoUs,
-                    dtMuestra: _dtMuestra,
-                  ),
-                ),
-              ),
-            ),
-
-            // ================= 3. HUD DE TELEMETRÍA =================
+            // HUD TELEMETRÍA
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
               color: const Color(0xFF0C1017),
@@ -383,8 +322,8 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(_telemetriaVoltaje, style: TextStyle(color: _coloresCH[_canalActivo], fontFamily: 'monospace', fontSize: 10, fontWeight: FontWeight.bold)),
-                      Text(_telemetriaTiempo, style: const TextStyle(color: Colors.white70, fontFamily: 'monospace', fontSize: 10)),
+                      Text(_telemetriaV, style: TextStyle(color: _coloresCH[_canalActivo], fontFamily: 'monospace', fontSize: 10, fontWeight: FontWeight.bold)),
+                      Text(_telemetriaT, style: const TextStyle(color: Colors.white70, fontFamily: 'monospace', fontSize: 10)),
                     ],
                   ),
                   if (_deltaMarcadores.isNotEmpty)
@@ -393,38 +332,39 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
               ),
             ),
 
-            // ================= 4. LIENZO / TABLA =================
+            // GRÁFICA / TABLA
             Expanded(
               child: _mostrarTabla
                   ? _construirTabla()
-                  : GestureDetector(
-                      onTapUp: (details) => _agregarMarcadorTáctil(details.localPosition, MediaQuery.of(context).size),
-                      child: Container(
-                        margin: const EdgeInsets.all(4),
-                        color: const Color(0xFF161B22),
-                        child: CustomPaint(
-                          painter: OsciloscopioPrincipalPainter(
-                            canales: _canales,
-                            visible: _visibilidad,
-                            colores: _coloresCH,
-                            vDiv: _vDiv,
-                            offsetY: _offsetY,
-                            invertir: _invertir,
-                            acople: _acople,
-                            usPorDiv: _usPorDiv,
-                            desplazamientoUs: _desplazamientoUs,
-                            dtMuestra: _dtMuestra,
-                            canalActivo: _canalActivo,
-                            marcadores: _marcadores,
+                  : LayoutBuilder(
+                      builder: (context, constraints) {
+                        return GestureDetector(
+                          onTapUp: (details) => _colocarMarcador(details.localPosition, Size(constraints.maxWidth, constraints.maxHeight)),
+                          child: Container(
+                            margin: const EdgeInsets.all(4),
+                            color: const Color(0xFF161B22),
+                            child: CustomPaint(
+                              painter: OsciloscopioPainter(
+                                canales: _canales,
+                                visible: _visible,
+                                colores: _coloresCH,
+                                vDiv: _vDiv,
+                                offsetY: _offsetY,
+                                acople: _acople,
+                                invertir: _invertir,
+                                canalActivo: _canalActivo,
+                                marcadores: _marcadores,
+                              ),
+                              child: Container(),
+                            ),
                           ),
-                          child: Container(),
-                        ),
-                      ),
+                        );
+                      },
                     ),
             ),
 
-            // ================= 5. PANEL DE CONTROL TÁCTIL =================
-            _construirControlesInferiores(),
+            // CONTROLES
+            _construirControles(),
           ],
         ),
       ),
@@ -440,16 +380,16 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
         itemCount: total - inicio,
         itemBuilder: (context, idx) {
           int i = inicio + idx;
-          double t = i * _dtMuestra * 1e6;
+          double t = i * _dtSimulado * 1e6;
           return Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
-                Text("${t.toStringAsFixed(2)} us", style: const TextStyle(color: Colors.white70, fontFamily: 'monospace', fontSize: 11)),
-                Text("CH1: ${_canales[0][i].toStringAsFixed(2)}V", style: TextStyle(color: _coloresCH[0], fontFamily: 'monospace', fontSize: 11)),
-                Text("CH2: ${_canales[1][i].toStringAsFixed(2)}V", style: TextStyle(color: _coloresCH[1], fontFamily: 'monospace', fontSize: 11)),
-                Text("CH3: ${_canales[2][i].toStringAsFixed(2)}V", style: TextStyle(color: _coloresCH[2], fontFamily: 'monospace', fontSize: 11)),
+                Text("${t.toStringAsFixed(2)} us", style: const TextStyle(color: Colors.white70, fontFamily: 'monospace', fontSize: 10)),
+                Text("CH1: ${_canales[0][i].toStringAsFixed(2)}V", style: TextStyle(color: _coloresCH[0], fontFamily: 'monospace', fontSize: 10)),
+                Text("CH2: ${_canales[1][i].toStringAsFixed(2)}V", style: TextStyle(color: _coloresCH[1], fontFamily: 'monospace', fontSize: 10)),
+                Text("CH3: ${_canales[2][i].toStringAsFixed(2)}V", style: TextStyle(color: _coloresCH[2], fontFamily: 'monospace', fontSize: 10)),
               ],
             ),
           );
@@ -458,10 +398,10 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
     );
   }
 
-  Widget _construirControlesInferiores() {
+  Widget _construirControles() {
     return Container(
       color: const Color(0xFF17202C),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
       child: Column(
         children: [
           Row(
@@ -481,9 +421,9 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
               for (int c = 0; c < 3; c++) ...[
                 Text("CH${c + 1}", style: TextStyle(color: _coloresCH[c], fontSize: 10, fontWeight: FontWeight.bold)),
                 Checkbox(
-                  value: _visibilidad[c],
+                  value: _visible[c],
                   activeColor: _coloresCH[c],
-                  onChanged: (val) => setState(() => _visibilidad[c] = val!),
+                  onChanged: (val) => setState(() => _visible[c] = val!),
                 ),
               ],
               ElevatedButton(
@@ -515,7 +455,7 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text("V/DIV: ${_vDiv[_canalActivo].toStringAsFixed(2)}V", style: const TextStyle(color: Colors.white70, fontSize: 9)),
+                    Text("V/DIV: ${_vDiv[_canalActivo].toStringAsFixed(1)}V", style: const TextStyle(color: Colors.white70, fontSize: 9)),
                     Slider(
                       value: _vDiv[_canalActivo],
                       min: 0.1,
@@ -531,4 +471,84 @@ class _OsciloscopioCompletoScreenState extends State<OsciloscopioCompletoScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text("OFFSET Y: ${_offsetY[_canalActivo].toStringAsFixed(
+                    Text("OFFSET: ${_offsetY[_canalActivo].toStringAsFixed(1)}", style: const TextStyle(color: Colors.white70, fontSize: 9)),
+                    Slider(
+                      value: _offsetY[_canalActivo],
+                      min: -4.0,
+                      max: 4.0,
+                      divisions: 16,
+                      activeColor: Colors.white70,
+                      onChanged: (v) => setState(() => _offsetY[_canalActivo] = v),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text("BASE T: ${_usPorDiv.toStringAsFixed(2)} us", style: const TextStyle(color: Colors.cyanAccent, fontSize: 9)),
+                    Slider(
+                      value: _usPorDiv,
+                      min: 0.1,
+                      max: 5.0,
+                      divisions: 49,
+                      activeColor: Colors.cyanAccent,
+                      onChanged: (v) => setState(() => _usPorDiv = v),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class OsciloscopioPainter extends CustomPainter {
+  final List<List<double>> canales;
+  final List<bool> visible;
+  final List<Color> colores;
+  final List<double> vDiv;
+  final List<double> offsetY;
+  final List<String> acople;
+  final List<bool> invertir;
+  final int canalActivo;
+  final List<MarcadorPunto> marcadores;
+
+  OsciloscopioPainter({
+    required this.canales,
+    required this.visible,
+    required this.colores,
+    required this.vDiv,
+    required this.offsetY,
+    required this.acople,
+    required this.invertir,
+    required this.canalActivo,
+    required this.marcadores,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const double mL = 34.0, mR = 8.0, mT = 8.0, mB = 8.0;
+    final rGrid = Rect.fromLTWH(mL, mT, size.width - mL - mR, size.height - mT - mB);
+
+    canvas.drawRect(rGrid, Paint()..color = const Color(0xFF141922));
+
+    double anchoC = rGrid.width / 10.0;
+    double altoC = rGrid.height / 8.0;
+
+    final pGrid = Paint()..color = const Color(0xFF263342)..strokeWidth = 1.0;
+    for (int i = 0; i <= 10; i++) {
+      canvas.drawLine(Offset(rGrid.left + i * anchoC, rGrid.top), Offset(rGrid.left + i * anchoC, rGrid.bottom), pGrid);
+    }
+    for (int i = 0; i <= 8; i++) {
+      canvas.drawLine(Offset(rGrid.left, rGrid.top + i * altoC), Offset(rGrid.right, rGrid.top + i * altoC), pGrid);
+    }
+
+    double yCenter = rGrid.top + 4 * altoC;
+    double xCenter = rGrid.left + 5 * anchoC;
+    final pEjes = Paint()..color = const Color(0xFF4C617A)..strokeWidth = 1.2..style = PaintingStyle.stroke;
+    canvas.drawLine(Offset(rGrid.left, yCenter), Offset(rGrid.right, yCenter), pEje
